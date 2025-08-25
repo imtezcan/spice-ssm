@@ -1,0 +1,59 @@
+verbose: True
+# DDM simulation parameters
+ddm_params:
+  starting_point: 0.5    # bias, z
+  boundary: 1.0          # decision boundary, a
+  tnd: 0.2               # non-decision time, Ter
+  drift: 1.0             # drift rate, v
+  diffusion: 1.0         # diffusion rate, s
+  urgency: 1.0
+  leakage: 0.2
+
+# PyBeam simulation parameters
+simulation_params:
+  load_rt_data: False
+  load_traces: False
+  save_rt_data: True
+  save_traces: False
+  rt_data_path: ''
+  path_pybeam_model: 'ugm'
+  n_sims: 8192
+
+# RNN setup
+rnn_params:
+  batch_size: 1024
+  hidden_dim: 16
+  hidden_layers: 0
+  min_dt: 0.01
+  max_dt: 0.01
+  pos_encoding: False
+
+# Training setup
+training_params:
+  checkpoint: False
+  checkpoint_load_path: ''
+  epochs: 10000
+  lr: 0.0001
+  lr_schedule: False
+  learn_threshold: False
+  train_test_ratio: 1.
+  train_interval: 5
+  plot_interval: 50
+  early_stopping: True
+  patience: 10000
+  device: cpu
+
+# SINDy setup
+sindy_params:
+  run_sindy: False
+  training:
+    poly_order: 2
+    threshold: 0.4  # SINDy sparsity threshold
+    ensemble: True
+    library_ensemble: False
+    dt_default: 0.008
+    fit_intercept: True
+    discrete_time: True
+
+debug_params:
+  print_gradients: False
