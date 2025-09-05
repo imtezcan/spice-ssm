@@ -1,4 +1,4 @@
-verbose: True
+verbose: False
 # DDM simulation parameters
 ddm_params:
   starting_point: 0.5    # bias, z
@@ -15,7 +15,7 @@ simulation_params:
   save_traces: False
   rt_data_path: ''
   path_pybeam_model: 'ddm/custom_models/changing_drift'
-  n_sims: 8192
+  n_sims: 1024
 
 # RNN setup
 rnn_params:
@@ -38,7 +38,7 @@ training_params:
   train_interval: 5
   plot_interval: 50
   early_stopping: False
-  patience: 10000
+  patience: 7500
   device: cpu
 
 # SINDy setup

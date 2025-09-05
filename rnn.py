@@ -51,9 +51,9 @@ class VectorizedEvidenceRNN(nn.Module):
     def init_trial(self, init_evidence=None, batch_size=1):
         self.batch_size = batch_size
 
-    def simulate(self, traces=False, n_sims=1):
+    def simulate(self, traces=False, n_sims=1, X=None, warmup=50):
         self.init_trial(batch_size=n_sims)
-        return self.forward(traces=traces)
+        return self.forward(traces=traces, h_input=X, warmup=warmup)
 
     def forward(self, h_input=None, traces=False, warmup=50):
         # max_steps = int(self.t_max / self.min_dt)
@@ -73,6 +73,9 @@ class VectorizedEvidenceRNN(nn.Module):
                 dtype=torch.float32,
                 device=self.device
             )
+
+        else:
+            h_input = torch.tensor(h_input, dtype=torch.float32, device=self.device)
 
         total_steps = max_steps + warmup  # Original seq_len + warmup
 

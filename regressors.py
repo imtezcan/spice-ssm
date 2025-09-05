@@ -211,7 +211,7 @@ class RNNRegressor(BaseEstimator):
 
         return losses_rnn, accuracies_rnn, losses_dis, accuracies_dis
 
-    def predict(self, X):
+    def predict(self, X, warmup=50):
         self.rnn.eval()
 
         dts = []
@@ -223,7 +223,7 @@ class RNNRegressor(BaseEstimator):
         # Simulate evidence traces
         self.logger.info('Simulating RTs and evidence traces from RNN...')
         with torch.no_grad():
-            time, evidence, time_trace, evidence_trace, drift_trace, diffusion_traces, decision_indices = self.rnn.simulate(traces=True, n_sims=len(X))
+            time, evidence, time_trace, evidence_trace, drift_trace, diffusion_traces, decision_indices = self.rnn.simulate(traces=True, n_sims=len(X), warmup=warmup)
             rts = time.detach().cpu().numpy()
             traces['evidence'] = evidence_trace
             traces['time'] = time_trace
