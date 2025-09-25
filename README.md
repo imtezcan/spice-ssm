@@ -1,8 +1,7 @@
-# autossm-2afc-thesis
-Automated discovery of sequential sampling models for 2-alternative forced-choice tasks (thesis version)
+# SPICE-SSM: Sparse and Interpretable Cognitive Equations for Sequential Sampling Models
 
-This project contains the code and data for the thesis "Automated discovery of sequential sampling models for
-2-alternative forced-choice tasks" by Ibrahim Muhip Tezcan, supervised by Daniel Weinhardt and Prof. Dr. Sebastian Musslick.
+SPICE-SSM is a project combining recurrent neural networks (RNNs) and Sparse Identification of Nonlinear Dynamical
+systems (SINDy) to automatically discover sequential sampling models directly from data.
 
 ## Running the code
 
