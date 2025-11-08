@@ -100,6 +100,7 @@ class AdversarialEvidenceAccumulationTrainer:
         self.optimizer_discriminator.zero_grad()
 
         if rt_fake is None:
+            self.rnn.eval()
             with torch.no_grad():
                 self.rnn.init_trial(batch_size=batch_size)
                 rt_fake, evidences = self.rnn(traces=False)

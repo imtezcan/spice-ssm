@@ -98,23 +98,18 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
         save_rt_data = False
         save_traces = False
     else:
-        rt, traces = simulate_rts(path_pybeam_model, phi, n_sims, logger)
+        rt_train, traces = simulate_rts(path_pybeam_model, phi, n_sims, logger)
+        rt_val, _ = simulate_rts(path_pybeam_model, phi, n_sims, logger)
 
     if save_rt_data:
-        save_rt_plot_and_data(rt, traces if save_traces else None, output_dir, logger)
+        save_rt_plot_and_data(rt_train, traces if save_traces else None, output_dir, logger)
 
-    # Split RT data into training and test set
-    t_max = np.max(abs(rt))
-    rt = torch.Tensor(rt).to(device)
-    rt_train = rt[:int(n_sims * train_test_ratio)]
-    if train_test_ratio == 1:
-        rt_test = rt_train
-    else:
-        rt_test = rt[int(n_sims * train_test_ratio):]
-
-    # Generate validation dataset
-    rt_val, _ = simulate_rts(path_pybeam_model, phi, 1024, logger)
-    rt_val = torch.Tensor(rt).to(device)
+    # Create training, validation and test sets
+    t_max_train = np.max(np.max(abs(rt_train)))
+    t_max_val = np.max(np.max(abs(rt_val)))
+    t_max = np.max([t_max_train, t_max_val])
+    rt_train = torch.Tensor(rt_train).to(device)
+    rt_val = torch.Tensor(rt_val).to(device)
 
     # Fit RNN
     rnn_regressor = RNNRegressor(hidden_dim=hidden_dim,
@@ -167,6 +162,9 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     plt.close()
 
     # Simulate RTs and traces from the trained RNN
+    test_sims = int(np.floor(n_sims * train_test_ratio).item())
+    rt_test, _ = simulate_rts(path_pybeam_model, phi, test_sims, logger)
+    rt_test = torch.Tensor(rt_test).to(device)
     rt_rnn, traces_sim, dts_sim, decision_indices = rnn_regressor.predict(rt_test)
     mean_drift_rate = np.mean([traces_sim['drift'][i].mean() for i in range (len(traces_sim['drift']))])
     logger.info(f'Original drift rate: {drift_rate}, RNN mean drift rate: {mean_drift_rate}')

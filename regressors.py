@@ -169,31 +169,40 @@ class RNNRegressor(BaseEstimator):
                     plt.show()
 
                 # Cross validation with the validation set
-                self.rnn.eval()
-                with torch.no_grad():
-                    rts_fake, evidence = self.rnn.simulate(traces=False, n_sims=len(rt_val))
-                    rts_fake = rts_fake.squeeze().detach()
-                    kld = compute_kld(rts_fake, rt_val.squeeze().detach(), n_bins=50)
-                    self.logger.info(f'KL-divergence predicted || real: {kld} best: {best_kld}')
-                    accuracies_rnn.append(-kld)
+                last_kld = accuracies_rnn[-1] if accuracies_rnn else 0
+                if epoch % 10 == 0:
+                    self.logger.info(f'Evaluating RNN on validation set...')
+                    self.rnn.eval()
+                    with torch.no_grad():
+                        rts_fake, evidence = self.rnn.simulate(traces=False, n_sims=len(rt_val))
+                        rts_fake = rts_fake.squeeze().detach()
+                        kld = compute_kld(rts_fake, rt_val.squeeze().detach(), n_bins=100)
+                        # self.logger.info(f'KL-divergence predicted || real: {kld} best: {best_kld}')
+                        accuracies_rnn.append(-kld)
+                        acc_average = -np.mean(accuracies_rnn)
+                        self.logger.info(f'Average KL-divergence predicted || real: {acc_average} best: {best_kld}')
+                else:
+                    accuracies_rnn.append(last_kld)
+                min_delta = 0.0001
+                save_interval = 100
                 if early_stopping:
-                    if kld <= best_kld + 0.001:
-                        best_kld = kld
+                    if acc_average <= best_kld - min_delta:
+                        best_kld = acc_average
                         patience_counter = 0
-                        self.save_checkpoint()
+                        self.save_checkpoint_light()
                     else:
                         patience_counter += 1
                         if patience_counter > patience:
-                            self.logger.info(f'Early stopping at epoch {epoch + 1}, best kld: {best_kld}')
+                            self.logger.info(f'Early stopping at epoch {epoch + 1}, best accuracy: {best_kld}')
                             self.load_checkpoint(load_path=self.checkpoint_save_path)
                             break
-                else:
-                    self.save_checkpoint()
+                elif (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
+                    self.save_checkpoint_light()
         except KeyboardInterrupt:
             if not early_stopping:
                 self.logger.warning(
                     'KeyboardInterrupt detected. Aborting training, saving checkpoint and continuing with further operations.')
-                self.save_checkpoint()
+                self.save_checkpoint_full()
             else:
                 self.logger.warning(
                     'KeyboardInterrupt detected. Early stopping is on, continuing from checkpoint with best accuracy.')
@@ -244,10 +253,31 @@ class RNNRegressor(BaseEstimator):
         params = torch.load(load_path, map_location=self.device, weights_only=True)
         # load rnn and optim parameters from params dict
         self.rnn.load_state_dict(params['rnn'], strict=False)
-        # self.optim_rnn.load_state_dict(params['optimizer_rnn'])
+        if 'optimizer_rnn' in params:
+            self.optim_rnn.load_state_dict(params['optimizer_rnn'])
         if 'discriminator' in params:
             self.discriminator.load_state_dict(params['discriminator'])
+        if 'optimizer_discriminator' in params:
             self.optim_discriminator.load_state_dict(params['optimizer_discriminator'])
+
+    # inside RNNRegressor
+    def save_checkpoint_light(self):
+        checkpoint = {
+            'rnn': {k: v.cpu() for k, v in self.rnn.state_dict().items()},
+            'discriminator': {k: v.cpu() for k, v in self.discriminator.state_dict().items()},
+            'config': {'path_parameters': self.path_parameters},
+        }
+        torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)
+
+    def save_checkpoint_full(self):
+        checkpoint = {
+            'rnn': self.rnn.state_dict(),
+            'discriminator': self.discriminator.state_dict(),
+            'optimizer_rnn': self.optim_rnn.state_dict(),
+            'optimizer_discriminator': self.optim_discriminator.state_dict(),
+            'config': {'path_parameters': self.path_parameters},
+        }
+        torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)
 
     def save_checkpoint(self):
         # save model

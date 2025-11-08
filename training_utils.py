@@ -44,7 +44,7 @@ def compute_kld(rt_real, rt_pred, n_bins=50):
     p = p + epsilon
     q = q + epsilon
 
-    return torch.sum(p * (torch.log(p) - torch.log(q))).detach().cpu()
+    return torch.sum(p * (torch.log(p) - torch.log(q))).detach().cpu().numpy()
 
 def fit_kdes(rt1, rt2, bandwidth='scott', kernel='gaussian'):
     kde1 = KernelDensity(bandwidth=bandwidth, kernel=kernel).fit(rt1.reshape(-1, 1))

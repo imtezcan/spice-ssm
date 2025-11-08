@@ -41,12 +41,15 @@ class VectorizedEvidenceRNN(nn.Module):
         )
 
         # Drift & Diffusion layer
-        self.linear_dx = nn.Linear(hidden_dim, 2)
-        self.linear_output = nn.Linear(2, 2)
+        # self.linear_dx = nn.Linear(hidden_dim, 1)
+        # self.linear_output = nn.Linear(1, 1)
+
+        self.mu_head = nn.Linear(hidden_dim, 1)
 
         # Init weights and biases
-        nn.init.kaiming_uniform_(self.linear_dx.weight, nonlinearity='leaky_relu', a=0.2)
-        nn.init.xavier_uniform_(self.linear_output.weight)
+        # nn.init.kaiming_uniform_(self.linear_dx.weight, nonlinearity='leaky_relu', a=0.2)
+        # nn.init.xavier_uniform_(self.linear_output.weight)
+        nn.init.xavier_uniform_(self.mu_head.weight)
 
     def init_trial(self, init_evidence=None, batch_size=1):
         self.batch_size = batch_size
@@ -57,7 +60,8 @@ class VectorizedEvidenceRNN(nn.Module):
 
     def forward(self, h_input=None, traces=False, warmup=50):
         # max_steps = int(self.t_max / self.min_dt)
-        max_steps = 100
+        max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
+        # max_steps = 100
         batch_size = self.batch_size
 
         hidden = torch.zeros(
@@ -92,19 +96,18 @@ class VectorizedEvidenceRNN(nn.Module):
 
         gru_out, _ = self.gru(h_input, hidden)
 
-        mu_sigma = self.linear_dx(gru_out)
-        mu_sigma = F.leaky_relu(mu_sigma, negative_slope=0.2)
-        mu_sigma = self.linear_output(mu_sigma)
-        mu_sigma = torch.exp(mu_sigma)
+        # mu = self.linear_dx(gru_out)
+        # mu = F.leaky_relu(mu, negative_slope=0.2)
+        # mu = self.linear_output(mu)
+        # mu = torch.exp(mu)
 
-        # Get drift rate
-        mu = mu_sigma[..., 0].unsqueeze(-1)
+        mu = F.softplus(self.mu_head(gru_out), beta=1.0)
 
-        # Get diffusion rate
-        sigma = mu_sigma[..., 1].unsqueeze(-1)
+        # Set sigma to 1.0 with the same shape as mu
+        sigma = torch.ones_like(mu, device=self.device)
 
         # Get timestep size
-        dt = self.t_max / max_steps
+        dt = torch.tensor(self.min_dt, device=self.device)
 
         # Calculate evidence
         epsilon = torch.randn((batch_size, max_steps, 1), device=self.device, requires_grad=False)
