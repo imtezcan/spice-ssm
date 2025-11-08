@@ -68,9 +68,25 @@ class RNNRegressor(BaseEstimator):
             positional_encoding=positional_encoding,
             device=device).to(device)
 
-        self.optim_rnn = torch.optim.Adam(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9))
+        # Set optimizer with selective weight decay: apply to GRU input/recurrent weights and linear layer weights
+        decay_params = []
+        nodecay_params = []
+        for name, param in self.rnn.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
+            is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
+            if is_gru_weight or is_linear_weight:
+                decay_params.append(param)
+            else:
+                nodecay_params.append(param)
+
+        self.optim_rnn = torch.optim.AdamW([
+            { 'params': decay_params, 'weight_decay': 0.0005 },
+            { 'params': nodecay_params, 'weight_decay': 0.0 },
+        ], lr=lr, betas=(0.5, 0.9))
         self.discriminator = ConvDiscriminator(batch_size).to(device)
-        self.optim_discriminator = torch.optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
+        self.optim_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
         if lr_schedule:
             lr_scheduler_linear = LinearLR(optimizer=self.optim_discriminator, start_factor=0.01, end_factor=1.0, total_iters=10)
             lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_discriminator, T_0=8, T_mult=2, eta_min=1e-6)
