@@ -41,6 +41,36 @@ class ConvDiscriminator(nn.Module):
         return self.model(x)
 
 
+class QuantileDiscriminator(nn.Module):
+    def __init__(self, n_quantiles=128, hidden_dim=256, input_range=None):
+        super().__init__()
+        self.n_quantiles = n_quantiles
+        self.input_range = input_range  # tuple (min_val, max_val) or None
+        self.mlp = nn.Sequential(
+            nn.Linear(n_quantiles, hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        # x: 1D tensor of RTs (batch of samples)
+        # Normalize to [-1, 1] for stability if range known
+        if self.input_range is not None:
+            lo, hi = self.input_range
+            mid = 0.5 * (lo + hi)
+            half = max(1e-6, 0.5 * (hi - lo))
+            x = (x - mid) / half  # roughly in [-1, 1]
+
+        # Compute fixed quantiles (differentiable subgradient in PyTorch)
+        # Avoid endpoints to reduce instability
+        eps = 1e-3
+        q_grid = torch.linspace(eps, 1.0 - eps, self.n_quantiles, device=x.device)
+        q = torch.quantile(x, q_grid)  # shape [n_quantiles]
+        return self.mlp(q)        
+
+
 class AdversarialEvidenceAccumulationTrainer:
 
     def __init__(self, rnn: VectorizedEvidenceRNN, optimizer_rnn: torch.optim.Adam, discriminator: nn.Module,

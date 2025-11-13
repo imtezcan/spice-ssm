@@ -39,20 +39,5 @@ class SimpleThresholdFunction(torch.autograd.Function):
             trajectory[batch_indices[idx], decision_times[idx].long()] + 1e-6
         )
 
-        # Surrogate gradient for non-crossers:
-        # Provide a smooth negative base gradient at the final step proportional to distance to boundary,
-        # so that dT/ddsdt is approximated when no crossing occurs.
-        # This helps learning escape the plateau where trajectories never hit the boundary.
-        non_cross_mask = (mask.sum(dim=1) == 0)  # samples that never cross
-        if non_cross_mask.any():
-            # Distance to boundary at final time: dist = b - |x_T| = -trajectory[:, -1]
-            dist_to_boundary = -trajectory[:, -1]
-            # Smooth weighting: larger when further inside the boundary
-            k = 10.0
-            surrogate_scale = 0.1
-            weight = torch.sigmoid(k * dist_to_boundary)  # in [0,1]
-            # Apply only to the final timestep for non-crossers; negative to mimic dT/ddsdt < 0
-            grads[non_cross_mask, -1] += -surrogate_scale * weight[non_cross_mask]
-
         grads = grads * grad_rt.unsqueeze(1).expand_as(grads) * signs.unsqueeze(-1)
         return grads, None, None, None, None, None

@@ -14,7 +14,7 @@ from training_utils import compute_kld
 
 from plotting import plot_rts_multi
 from rnn import VectorizedEvidenceRNN
-from trainers import ConvDiscriminator, AdversarialEvidenceAccumulationTrainer
+from trainers import AdversarialEvidenceAccumulationTrainer, QuantileDiscriminator
 PYBEAM_DEFAULT_DT = 0.0001
 
 
@@ -68,9 +68,31 @@ class RNNRegressor(BaseEstimator):
             positional_encoding=positional_encoding,
             device=device).to(device)
 
-        self.optim_rnn = torch.optim.Adam(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9))
-        self.discriminator = ConvDiscriminator(batch_size).to(device)
-        self.optim_discriminator = torch.optim.Adam(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
+        # # Set optimizer with selective weight decay: apply only to GRU input weights and output layer weights
+        # decay_params = []
+        # nodecay_params = []
+        # for name, param in self.rnn.named_parameters():
+        #     if not param.requires_grad:
+        #         continue
+        #     # is_gru_input_weight = name.startswith('gru') and ('weight_ih' in name)
+        #     # is_output_weight = (name.startswith('linear_') and name.endswith('weight'))
+        #     # if is_gru_input_weight or is_output_weight:
+        #     is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
+        #     is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
+        #     if is_gru_weight or is_linear_weight:            
+        #         decay_params.append(param)
+        #     else:
+        #         nodecay_params.append(param)
+
+        # self.optim_rnn = torch.optim.AdamW([
+        #     { 'params': decay_params, 'weight_decay': 1e-4 },
+        #     { 'params': nodecay_params, 'weight_decay': 0.0 },
+        # ], lr=lr, betas=(0.5, 0.9))            
+
+        self.optim_rnn = torch.optim.AdamW(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9))
+        # self.discriminator = ConvDiscriminator(batch_size).to(device)
+        self.discriminator = QuantileDiscriminator(n_quantiles=128, hidden_dim=256, input_range=(-t_max, t_max)).to(device)
+        self.optim_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
         if lr_schedule:
             lr_scheduler_linear = LinearLR(optimizer=self.optim_discriminator, start_factor=0.01, end_factor=1.0, total_iters=10)
             lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_discriminator, T_0=8, T_mult=2, eta_min=1e-6)
@@ -194,7 +216,7 @@ class RNNRegressor(BaseEstimator):
                         patience_counter += 1
                         if patience_counter > patience:
                             self.logger.info(f'Early stopping at epoch {epoch + 1}, best accuracy: {best_kld}')
-                            self.load_checkpoint(load_path=self.checkpoint_save_path)
+                            # self.load_checkpoint(load_path=self.checkpoint_save_path)
                             break
                 elif (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
                     self.save_checkpoint_light()
@@ -205,7 +227,7 @@ class RNNRegressor(BaseEstimator):
                 self.save_checkpoint_full()
             else:
                 self.logger.warning(
-                    'KeyboardInterrupt detected. Early stopping is on, continuing from checkpoint with best accuracy.')
+                    'KeyboardInterrupt detected. Early stopping is on, loading from last checkpoint.')
                 self.load_checkpoint(load_path=self.checkpoint_save_path)
         self.logger.info(f'Training finished.\nCheckpoint saved under {self.checkpoint_save_path}')
 

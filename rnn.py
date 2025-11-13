@@ -41,24 +41,27 @@ class VectorizedEvidenceRNN(nn.Module):
         )
 
         # Drift & Diffusion layer
-        # self.linear_dx = nn.Linear(hidden_dim, 1)
+        self.linear_dx = nn.Linear(hidden_dim, 1)
         # self.linear_output = nn.Linear(1, 1)
 
-        self.mu_head = nn.Linear(hidden_dim, 1)
+        # self.mu_head = nn.Linear(hidden_dim, 1)
 
         # Init weights and biases
         # nn.init.kaiming_uniform_(self.linear_dx.weight, nonlinearity='leaky_relu', a=0.2)
+        nn.init.xavier_uniform_(self.linear_dx.weight)
         # nn.init.xavier_uniform_(self.linear_output.weight)
-        nn.init.xavier_uniform_(self.mu_head.weight)
+        
+        # nn.init.xavier_uniform_(self.mu_head.weight)
+        self.linear_dx.bias.data.fill_(-0.7)
 
     def init_trial(self, init_evidence=None, batch_size=1):
         self.batch_size = batch_size
 
-    def simulate(self, traces=False, n_sims=1, X=None, warmup=50):
+    def simulate(self, traces=False, n_sims=1, X=None, warmup=0):
         self.init_trial(batch_size=n_sims)
         return self.forward(traces=traces, h_input=X, warmup=warmup)
 
-    def forward(self, h_input=None, traces=False, warmup=50):
+    def forward(self, h_input=None, traces=False, warmup=0):
         # max_steps = int(self.t_max / self.min_dt)
         max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
         # max_steps = 100
@@ -90,18 +93,22 @@ class VectorizedEvidenceRNN(nn.Module):
             warmup_input = full_input[:, :warmup]
             h_input = full_input[:, warmup:]
         else:
-            warmup_input = torch.zeros((batch_size, warmup, self.dx_dim), device=self.device)
+            warmup_input = torch.ones((batch_size, warmup, self.dx_dim), device=self.device)
         if warmup > 0:
             _, hidden = self.gru(warmup_input, hidden)
 
         gru_out, _ = self.gru(h_input, hidden)
 
-        # mu = self.linear_dx(gru_out)
+        mu = self.linear_dx(gru_out)
         # mu = F.leaky_relu(mu, negative_slope=0.2)
+        # mu = F.relu(mu)
         # mu = self.linear_output(mu)
-        # mu = torch.exp(mu)
+        # mu = torch.exp(mu - 2.5)
+        mu = F.softplus(mu, beta=1.0)
+        # mu = F.relu(mu) - math.log(2.0)
 
-        mu = F.softplus(self.mu_head(gru_out), beta=1.0)
+        # mu = F.softplus(self.mu_head(gru_out), beta=1.0) - math.log(2.0)
+        # mu = torch.clamp(mu, min=1e-6)
 
         # Set sigma to 1.0 with the same shape as mu
         sigma = torch.ones_like(mu, device=self.device)
