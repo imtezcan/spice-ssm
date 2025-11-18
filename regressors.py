@@ -136,8 +136,9 @@ class RNNRegressor(BaseEstimator):
         rt_train.detach()
         train_dataset = TensorDataset(rt_train)
         train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True)
-        best_kld = np.inf
+        best_acc = -np.inf
         patience_counter = 0
+        save_interval = 100
         try:
             self.logger.info('Training RNN...')
             for epoch in range(epochs):
@@ -191,35 +192,34 @@ class RNNRegressor(BaseEstimator):
                     plt.show()
 
                 # Cross validation with the validation set
-                last_kld = accuracies_rnn[-1] if accuracies_rnn else 0
+                last_acc = accuracies_rnn[-1] if accuracies_rnn else 0
                 if epoch % 10 == 0:
                     self.logger.info(f'Evaluating RNN on validation set...')
                     self.rnn.eval()
                     with torch.no_grad():
                         rts_fake, evidence = self.rnn.simulate(traces=False, n_sims=len(rt_val))
                         rts_fake = rts_fake.squeeze().detach()
-                        kld = compute_kld(rts_fake, rt_val.squeeze().detach(), n_bins=100)
+                        kld_val = compute_kld(rts_fake, rt_val.squeeze().detach(), n_bins=128)
+                        kld_train = compute_kld(rts_fake_epoch.squeeze().detach(), rts_real_epoch.squeeze().detach(), n_bins=128)
                         # self.logger.info(f'KL-divergence predicted || real: {kld} best: {best_kld}')
-                        accuracies_rnn.append(-kld)
-                        acc_average = -np.mean(accuracies_rnn)
-                        self.logger.info(f'Average KL-divergence predicted || real: {acc_average} best: {best_kld}')
+                        accuracies_rnn.append(-kld_val)
+                        self.logger.info(f'Accuracy (train): {-kld_train} (val): {-kld_val} best (val): {best_acc}')
+
+                    if early_stopping:
+                        if last_acc >= best_acc and last_acc != 0.0:
+                            best_acc = last_acc
+                            patience_counter = 0
+                            self.save_checkpoint_light()
+                        else:
+                            patience_counter += 1
+                            if patience_counter > patience:
+                                self.logger.info(f'Early stopping at epoch {epoch + 1}, best accuracy: {best_acc}')
+                                self.load_checkpoint(load_path=self.checkpoint_save_path)
+                                break                        
                 else:
-                    accuracies_rnn.append(last_kld)
-                min_delta = 0.0001
-                save_interval = 100
-                if early_stopping:
-                    if acc_average <= best_kld - min_delta:
-                        best_kld = acc_average
-                        patience_counter = 0
-                        self.save_checkpoint_light()
-                    else:
-                        patience_counter += 1
-                        if patience_counter > patience:
-                            self.logger.info(f'Early stopping at epoch {epoch + 1}, best accuracy: {best_kld}')
-                            # self.load_checkpoint(load_path=self.checkpoint_save_path)
-                            break
-                elif (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
-                    self.save_checkpoint_light()
+                    accuracies_rnn.append(last_acc)
+                    if (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
+                        self.save_checkpoint_light()                    
         except KeyboardInterrupt:
             if not early_stopping:
                 self.logger.warning(

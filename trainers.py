@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 from debug import print_grads
 
 from rnn import VectorizedEvidenceRNN
@@ -47,11 +48,13 @@ class QuantileDiscriminator(nn.Module):
         self.n_quantiles = n_quantiles
         self.input_range = input_range  # tuple (min_val, max_val) or None
         self.mlp = nn.Sequential(
-            nn.Linear(n_quantiles, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_dim, 1),
+            spectral_norm(nn.Linear(n_quantiles, hidden_dim)),
+            nn.LeakyReLU(0.05, inplace=True),
+            # nn.Dropout(0.1),
+            spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
+            nn.LeakyReLU(0.05, inplace=True),
+            # nn.Dropout(0.1),
+            spectral_norm(nn.Linear(hidden_dim, 1)),
         )
 
     def forward(self, x):
@@ -68,13 +71,27 @@ class QuantileDiscriminator(nn.Module):
         eps = 1e-3
         q_grid = torch.linspace(eps, 1.0 - eps, self.n_quantiles, device=x.device)
         q = torch.quantile(x, q_grid)  # shape [n_quantiles]
+        # q = q + 0.01 * torch.randn_like(q)
         return self.mlp(q)        
 
 
 class AdversarialEvidenceAccumulationTrainer:
 
-    def __init__(self, rnn: VectorizedEvidenceRNN, optimizer_rnn: torch.optim.Adam, discriminator: nn.Module,
-                 optimizer_discriminator: torch.optim.Adam, train_interval=1, device='cpu', print_gradients=False, scheduler=None):
+    def __init__(
+        self,
+        rnn: VectorizedEvidenceRNN,
+        optimizer_rnn: torch.optim.Optimizer,
+        discriminator: nn.Module,
+        optimizer_discriminator: torch.optim.Optimizer,
+        train_interval: int = 1,
+        device: str = 'cpu',
+        print_gradients: bool = False,
+        scheduler=None,
+        # Additional generator regularization terms
+        moment_loss_weight: float = 0.0,
+        quantile_loss_weight: float = 0.0,
+        quantile_levels=None,
+    ):
 
         self.device = device
 
@@ -89,6 +106,15 @@ class AdversarialEvidenceAccumulationTrainer:
         self.gradient_penalty_weight = 10
         self.print_gradients = print_gradients
         self.scheduler = scheduler
+
+        # Weights for additional structure-matching losses on RT distributions
+        self.moment_loss_weight = moment_loss_weight
+        self.quantile_loss_weight = quantile_loss_weight
+        if quantile_levels is None:
+            # Default to a small set of interior quantiles
+            quantile_levels = [0.1, 0.3, 0.5, 0.7, 0.9]
+        # Store as tensor for efficient use in training loop
+        self.quantile_levels = torch.tensor(quantile_levels, dtype=torch.float32, device=self.device)
 
     def train(self, rt_real: torch.Tensor):
         batch_size = len(rt_real)
@@ -113,11 +139,38 @@ class AdversarialEvidenceAccumulationTrainer:
             # compute score by the discriminator
             score_rnn = self.discriminator(rt_fake)
 
+            # Base adversarial loss
             loss_rnn = self.loss_rnn(score_rnn)
+
+            # ------------------------------------------
+            # Optional structure-matching losses
+            # Match low-order moments and a few quantiles
+            # of the RT distribution between real and fake.
+            # ------------------------------------------
+            rt_real_flat = rt_real.view(-1)
+            rt_fake_flat = rt_fake.view(-1)
+
+            # Moment matching: mean and variance
+            if self.moment_loss_weight > 0.0:
+                mean_real = rt_real_flat.mean()
+                mean_fake = rt_fake_flat.mean()
+                var_real = rt_real_flat.var(unbiased=False)
+                var_fake = rt_fake_flat.var(unbiased=False)
+                moment_loss = (mean_real - mean_fake).pow(2) + (var_real - var_fake).pow(2)
+                loss_rnn = loss_rnn + self.moment_loss_weight * moment_loss
+
+            # Quantile matching at fixed probability levels
+            if self.quantile_loss_weight > 0.0:
+                q_levels = self.quantile_levels.to(rt_real_flat.device)
+                q_real = torch.quantile(rt_real_flat, q_levels)
+                q_fake = torch.quantile(rt_fake_flat, q_levels)
+                quantile_loss = (q_real - q_fake).pow(2).mean()
+                loss_rnn = loss_rnn + self.quantile_loss_weight * quantile_loss
+
             loss_rnn.backward()
             if self.print_gradients:
                 print_grads(self.rnn)
-            torch.nn.utils.clip_grad_norm_(self.rnn.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(self.rnn.parameters(), max_norm=1.0)
             self.optimizer_rnn.step()
             last_loss_rnn = loss_rnn
         else:

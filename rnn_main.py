@@ -108,6 +108,7 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     t_max_train = np.max(np.max(abs(rt_train)))
     t_max_val = np.max(np.max(abs(rt_val)))
     t_max = np.max([t_max_train, t_max_val])
+    t_max = np.max([t_max, 5.0])
     rt_train = torch.Tensor(rt_train).to(device)
     rt_val = torch.Tensor(rt_val).to(device)
 
