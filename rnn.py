@@ -52,7 +52,10 @@ class VectorizedEvidenceRNN(nn.Module):
         # nn.init.xavier_uniform_(self.linear_output.weight)
         
         # nn.init.xavier_uniform_(self.mu_head.weight)
-        self.linear_dx.bias.data.fill_(-0.7)
+        # self.linear_dx.bias.data.fill_(0.0)
+        # nn.init.xavier_uniform_(self.linear_dx.weight, gain=0.1)  # small scale
+        self.linear_dx.bias.data.zero_()
+        # self.linear_output.bias.data.zero_()
 
     def init_trial(self, init_evidence=None, batch_size=1):
         self.batch_size = batch_size
@@ -62,9 +65,8 @@ class VectorizedEvidenceRNN(nn.Module):
         return self.forward(traces=traces, h_input=X, warmup=warmup)
 
     def forward(self, h_input=None, traces=False, warmup=5):
-        # max_steps = int(self.t_max / self.min_dt)
-        max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
-        # max_steps = 100
+        # max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
+        max_steps = 100
         batch_size = self.batch_size
 
         hidden = torch.zeros(
@@ -104,18 +106,18 @@ class VectorizedEvidenceRNN(nn.Module):
         # mu = F.relu(mu)
         # mu = self.linear_output(mu)
         # mu = torch.exp(mu - 2.5)
-        mu = F.softplus(mu, beta=1.0) - 1.0
+        # mu = F.softplus(mu, beta=1.0) - 1.0
         # mu = F.relu(mu) - math.log(2.0)
 
         # mu = F.softplus(self.mu_head(gru_out), beta=1.0) - math.log(2.0)
-        # mu = torch.clamp(mu, min=1e-6)
+        mu = torch.clamp(mu, min=-10.0, max=10.0)
 
         # Set sigma to 1.0 with the same shape as mu
         sigma = torch.ones_like(mu, device=self.device)
 
         # Get timestep size
-        dt = torch.tensor(self.min_dt, device=self.device)
-
+        # dt = torch.tensor(self.min_dt, device=self.device)
+        dt = self.t_max / max_steps
         # Calculate evidence
         epsilon = torch.randn((batch_size, max_steps, 1), device=self.device, requires_grad=False)
         dx = mu * dt + sigma * epsilon * torch.sqrt(dt)

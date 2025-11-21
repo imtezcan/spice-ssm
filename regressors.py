@@ -7,14 +7,14 @@ import numpy as np
 import pysindy as ps
 import torch
 from sklearn.base import BaseEstimator
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR, CosineAnnealingLR
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, DataLoader
 from training_utils import compute_kld
 
 from plotting import plot_rts_multi
 from rnn import VectorizedEvidenceRNN
-from trainers import AdversarialEvidenceAccumulationTrainer, QuantileDiscriminator
+from trainers import AdversarialEvidenceAccumulationTrainer, QuantileDiscriminator, QuantileTrainer
 PYBEAM_DEFAULT_DT = 0.0001
 
 
@@ -68,41 +68,52 @@ class RNNRegressor(BaseEstimator):
             positional_encoding=positional_encoding,
             device=device).to(device)
 
-        # # Set optimizer with selective weight decay: apply only to GRU input weights and output layer weights
-        # decay_params = []
-        # nodecay_params = []
-        # for name, param in self.rnn.named_parameters():
-        #     if not param.requires_grad:
-        #         continue
-        #     # is_gru_input_weight = name.startswith('gru') and ('weight_ih' in name)
-        #     # is_output_weight = (name.startswith('linear_') and name.endswith('weight'))
-        #     # if is_gru_input_weight or is_output_weight:
-        #     is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
-        #     is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
-        #     if is_gru_weight or is_linear_weight:            
-        #         decay_params.append(param)
-        #     else:
-        #         nodecay_params.append(param)
+        # Set optimizer with selective weight decay: apply only to GRU input weights and output layer weights
+        decay_params = []
+        nodecay_params = []
+        for name, param in self.rnn.named_parameters():
+            if not param.requires_grad:
+                continue
+            # is_gru_input_weight = name.startswith('gru') and ('weight_ih' in name)
+            # is_output_weight = (name.startswith('linear_') and name.endswith('weight'))
+            # if is_gru_input_weight or is_output_weight:
+            is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
+            is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
+            if is_gru_weight or is_linear_weight:            
+                decay_params.append(param)
+            else:
+                nodecay_params.append(param)
 
-        # self.optim_rnn = torch.optim.AdamW([
-        #     { 'params': decay_params, 'weight_decay': 1e-4 },
-        #     { 'params': nodecay_params, 'weight_decay': 0.0 },
-        # ], lr=lr, betas=(0.5, 0.9))            
+        self.optim_rnn = torch.optim.AdamW([
+            { 'params': decay_params, 'weight_decay': 1e-4 },
+            { 'params': nodecay_params, 'weight_decay': 0.0 },
+        ], lr=lr, betas=(0.5, 0.9))            
 
-        self.optim_rnn = torch.optim.AdamW(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9))
+        # self.optim_rnn = torch.optim.AdamW(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9), weight_decay=1e-4)
         # self.discriminator = ConvDiscriminator(batch_size).to(device)
-        self.discriminator = QuantileDiscriminator(n_quantiles=128, hidden_dim=256, input_range=(-t_max, t_max)).to(device)
-        self.optim_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
+        # self.discriminator = QuantileDiscriminator(n_quantiles=128, hidden_dim=256, input_range=(-t_max, t_max)).to(device)
+        # self.optim_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
+        # if lr_schedule:
+        #     lr_scheduler_linear = LinearLR(optimizer=self.optim_discriminator, start_factor=0.01, end_factor=1.0, total_iters=10)
+        #     lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_discriminator, T_0=8, T_mult=2, eta_min=1e-6)
+        #     lr_scheduler = SequentialLR(optimizer=self.optim_discriminator, schedulers=[lr_scheduler_linear, lr_scheduler_cosine], milestones=[10])
+        # else:
+        #     lr_scheduler = None
+        # self.trainer = AdversarialEvidenceAccumulationTrainer(self.rnn, self.optim_rnn, self.discriminator,
+        #                                                       self.optim_discriminator,
+        #                                                       device=device, train_interval=train_interval,
+        #                                                       print_gradients=print_gradients, scheduler=lr_scheduler)
         if lr_schedule:
-            lr_scheduler_linear = LinearLR(optimizer=self.optim_discriminator, start_factor=0.01, end_factor=1.0, total_iters=10)
-            lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_discriminator, T_0=8, T_mult=2, eta_min=1e-6)
-            lr_scheduler = SequentialLR(optimizer=self.optim_discriminator, schedulers=[lr_scheduler_linear, lr_scheduler_cosine], milestones=[10])
+            # lr_scheduler_linear = LinearLR(optimizer=self.optim_rnn, start_factor=0.01, end_factor=1.0, total_iters=10)
+            # lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_rnn, T_0=8, T_mult=2, eta_min=1e-6)
+            # self.lr_scheduler = SequentialLR(optimizer=self.optim_rnn, schedulers=[lr_scheduler_linear, lr_scheduler_cosine], milestones=[10])
+            self.lr_scheduler = CosineAnnealingLR(self.optim_rnn, T_max=8192, eta_min=1e-6)
         else:
-            lr_scheduler = None
-        self.trainer = AdversarialEvidenceAccumulationTrainer(self.rnn, self.optim_rnn, self.discriminator,
-                                                              self.optim_discriminator,
-                                                              device=device, train_interval=train_interval,
-                                                              print_gradients=print_gradients, scheduler=lr_scheduler)
+            self.lr_scheduler = None
+        self.trainer = QuantileTrainer(self.rnn, self.optim_rnn,
+                                      device=device,
+                                      print_gradients=print_gradients,
+                                      moment_loss_weight=0.0)
 
 
         self.verbose = verbose
@@ -219,7 +230,9 @@ class RNNRegressor(BaseEstimator):
                 else:
                     accuracies_rnn.append(last_acc)
                     if (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
-                        self.save_checkpoint_light()                    
+                        self.save_checkpoint_light()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()                                            
         except KeyboardInterrupt:
             if not early_stopping:
                 self.logger.warning(
@@ -242,7 +255,7 @@ class RNNRegressor(BaseEstimator):
 
         return losses_rnn, accuracies_rnn, losses_dis, accuracies_dis
 
-    def predict(self, X, warmup=50):
+    def predict(self, X, warmup=5):
         self.rnn.eval()
 
         dts = []
@@ -286,7 +299,7 @@ class RNNRegressor(BaseEstimator):
     def save_checkpoint_light(self):
         checkpoint = {
             'rnn': {k: v.cpu() for k, v in self.rnn.state_dict().items()},
-            'discriminator': {k: v.cpu() for k, v in self.discriminator.state_dict().items()},
+            # 'discriminator': {k: v.cpu() for k, v in self.discriminator.state_dict().items()},
             'config': {'path_parameters': self.path_parameters},
         }
         torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)
@@ -294,9 +307,9 @@ class RNNRegressor(BaseEstimator):
     def save_checkpoint_full(self):
         checkpoint = {
             'rnn': self.rnn.state_dict(),
-            'discriminator': self.discriminator.state_dict(),
+            # 'discriminator': self.discriminator.state_dict(),
             'optimizer_rnn': self.optim_rnn.state_dict(),
-            'optimizer_discriminator': self.optim_discriminator.state_dict(),
+            # 'optimizer_discriminator': self.optim_discriminator.state_dict(),
             'config': {'path_parameters': self.path_parameters},
         }
         torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)

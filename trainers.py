@@ -238,3 +238,90 @@ class AdversarialEvidenceAccumulationTrainer:
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * self.gradient_penalty_weight
 
         return gradient_penalty
+
+
+class QuantileTrainer:
+
+    def __init__(
+        self,
+        rnn: VectorizedEvidenceRNN,
+        optimizer_rnn: torch.optim.Optimizer,
+        device: str = 'cpu',
+        print_gradients: bool = False,
+        # Additional generator regularization terms
+        moment_loss_weight: float = 0.0,
+        quantile_levels=None,
+    ):
+
+        self.device = device
+
+        self.rnn = rnn
+        self.optimizer_rnn = optimizer_rnn
+        self.clip_value = 0.01
+        self.print_gradients = print_gradients
+
+        # Weights for additional structure-matching losses on RT distributions
+        self.moment_loss_weight = moment_loss_weight
+
+    def train(self, rt_real: torch.Tensor):
+        batch_size = len(rt_real)
+        rt_fake = None
+
+        self.optimizer_rnn.zero_grad()
+        self.rnn.train()
+        self.rnn.init_trial(batch_size=batch_size)
+        rt_fake, _ = self.rnn(traces=False)
+
+        rt_real_pos = rt_real[rt_real >= 0]
+        rt_real_neg = rt_real[rt_real < 0]
+        rt_fake_pos = rt_fake[rt_fake >= 0]
+        rt_fake_neg = rt_fake[rt_fake < 0]
+
+        loss_pos = self.quantile_loss(rt_real_pos, rt_fake_pos)
+        loss_neg = self.quantile_loss(rt_real_neg, rt_fake_neg)
+
+        # Base distributional loss from quantiles (separate for positive/negative RTs)
+        loss_rnn = loss_pos + loss_neg
+
+        # ------------------------------------------
+        # Optional structure-matching moments
+        # Match mean and variance of RTs separately
+        # for positive and negative subsets.
+        # ------------------------------------------
+        if self.moment_loss_weight > 0.0:
+            # Positive RTs
+            if rt_real_pos.numel() > 1 and rt_fake_pos.numel() > 1:
+                mean_real_pos = rt_real_pos.mean()
+                mean_fake_pos = rt_fake_pos.mean()
+                moment_pos = (mean_real_pos - mean_fake_pos).pow(2)
+            else:
+                moment_pos = 0.0 * loss_rnn
+
+            # Negative RTs
+            if rt_real_neg.numel() > 1 and rt_fake_neg.numel() > 1:
+                mean_real_neg = rt_real_neg.mean()
+                mean_fake_neg = rt_fake_neg.mean()
+                moment_neg = (mean_real_neg - mean_fake_neg).pow(2)
+            else:
+                moment_neg = 0.0 * loss_rnn
+
+            moment_loss = moment_pos + moment_neg
+            loss_rnn = loss_rnn + self.moment_loss_weight * moment_loss
+
+        loss_rnn.backward()
+        if self.print_gradients:
+            print_grads(self.rnn)
+        torch.nn.utils.clip_grad_norm_(self.rnn.parameters(), max_norm=1.0)
+        self.optimizer_rnn.step()
+
+        return loss_rnn.item(), rt_fake, rt_real
+
+    def quantile_loss(self, rt_real, rt_fake):
+        if len(rt_real) < 5 or len(rt_fake) < 5:
+            # return 0.0 * rt_real.mean()  # safe zero with grad
+            return (rt_fake[:1] * 0).sum()
+        q_levels = torch.linspace(0.01, 0.99, 50, device=rt_real.device)
+        q_real = torch.quantile(rt_real, q_levels)
+        q_fake = torch.quantile(rt_fake, q_levels)
+        return (q_real - q_fake).abs().mean()  # or .pow(2).mean()
+        # return (q_real - q_fake).pow(2).mean()  # or .pow(2).mean()

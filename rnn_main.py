@@ -142,7 +142,7 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                                                                patience=patience)
 
     # Plot losses and accuracies
-    plt.plot(smooth(losses_dis), label='Discriminator Losses')
+    # plt.plot(smooth(losses_dis), label='Discriminator Losses')
     plt.plot(smooth(losses_rnn), label='RNN Losses')
     plt.legend()
     plot_file = os.path.join(output_dir, 'figures', 'loss.png')
@@ -152,7 +152,7 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
         plt.show()
     plt.close()
 
-    plt.plot(smooth(accuracies_dis), label='Discriminator Accuracy')
+    # plt.plot(smooth(accuracies_dis), label='Discriminator Accuracy')
     plt.plot(smooth(accuracies_rnn), label='RNN Accuracy')
     plt.legend()
     plot_file = os.path.join(output_dir, 'figures', 'acc.png')
