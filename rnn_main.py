@@ -49,7 +49,6 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
         batch_size = n_sims
     min_dt = rnn_params['min_dt']
     max_dt = rnn_params['max_dt']
-    pos_encoding = rnn_params['pos_encoding']
 
     # Training parameters
     checkpoint = training_params['checkpoint']
@@ -58,7 +57,6 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     lr = training_params['lr']
     lr_schedule = training_params.get('lr_schedule', False)
     train_test_ratio = training_params['train_test_ratio']
-    train_interval = training_params['train_interval']
     early_stopping = training_params['early_stopping']
     patience = training_params['patience']
     plot_interval = training_params['plot_interval']
@@ -118,7 +116,6 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                  lr=lr,
                                  lr_schedule=lr_schedule,
                                  batch_size=batch_size,
-                                 train_interval=train_interval,
                                  init_evidence=starting_point - 0.5,  # subtract 0.5 to center the evidence
                                  init_time=tnd,
                                  threshold=boundary,
@@ -126,7 +123,6 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                  t_max=t_max,
                                  min_dt=min_dt,
                                  max_dt=max_dt,
-                                 positional_encoding=pos_encoding,
                                  checkpoint_load_path=checkpoint_load_path,
                                  save_path=output_dir,
                                  plot_interval=plot_interval,
@@ -135,27 +131,17 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                  verbose=verbose,
                                  print_gradients=print_gradients)
 
-    losses_rnn, accuracies_rnn, losses_dis, accuracies_dis = rnn_regressor.fit(rt_train,
+    losses_rnn, losses_val = rnn_regressor.fit(rt_train,
                                                                                rt_val=rt_val,
                                                                                epochs=epochs,
                                                                                early_stopping=early_stopping,
                                                                                patience=patience)
 
     # Plot losses and accuracies
-    # plt.plot(smooth(losses_dis), label='Discriminator Losses')
-    plt.plot(smooth(losses_rnn), label='RNN Losses')
+    plt.plot(smooth(losses_rnn), label='Training Losses')
+    plt.plot(smooth(losses_val), label='Validation Losses')
     plt.legend()
     plot_file = os.path.join(output_dir, 'figures', 'loss.png')
-    os.makedirs(os.path.dirname(plot_file), exist_ok=True)
-    plt.savefig(plot_file)
-    if verbose:
-        plt.show()
-    plt.close()
-
-    # plt.plot(smooth(accuracies_dis), label='Discriminator Accuracy')
-    plt.plot(smooth(accuracies_rnn), label='RNN Accuracy')
-    plt.legend()
-    plot_file = os.path.join(output_dir, 'figures', 'acc.png')
     os.makedirs(os.path.dirname(plot_file), exist_ok=True)
     plt.savefig(plot_file)
     if verbose:
@@ -167,12 +153,8 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     rt_test, _ = simulate_rts(path_pybeam_model, phi, test_sims, logger)
     rt_test = torch.Tensor(rt_test).to(device)
     rt_rnn, traces_sim, dts_sim, decision_indices = rnn_regressor.predict(rt_test)
-    mean_drift_rate = np.mean([traces_sim['drift'][i].mean() for i in range (len(traces_sim['drift']))])
-    logger.info(f'Original drift rate: {drift_rate}, RNN mean drift rate: {mean_drift_rate}')
-    mean_diffusion_rate = np.mean([traces_sim['diffusion'][i].mean() for i in range (len(traces_sim['diffusion']))])
-    logger.info(f'Original diffusion rate: {diffusion_rate}, RNN mean diffusion rate: {mean_diffusion_rate}')
     # Get average time step
-    dt_sim = float(np.mean(np.array(dts_sim)[np.where(~np.isnan(dts_sim))[0]]))
+    dt_sim = dts_sim[0]
     if dt_sim == 0:
         dt_sim = 1e-5
 
@@ -195,7 +177,7 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     # Simulate new evidence traces with dt_rnn for comparison of evidence traces
     evidence_traces_test = []
     if traces is not None:
-        obs, traces = pbc.simulate(N_sims=n_sims, model_dir=path_pybeam_model, phi=phi, dt=dt_sim, get_traces=True)
+        obs, traces = pbc.simulate(N_sims=n_sims, model_dir=path_pybeam_model, phi=phi, dt=dt_sim.item(), get_traces=True)
         for trace in traces:
             idx_non_zero = np.where(trace != 0)[0][-1]
             trace = trace[:idx_non_zero]
@@ -224,15 +206,22 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                                      training_params=sindy_params['training'],
                                                      simulation_params=ddm_params,
                                                      t_max=t_max,
-                                                     device=device,
                                                      verbose=verbose,
                                                      logger=logger)
         logger.info('Fitting SINDy model...')
-        sindy_regressor.fit(traces_sim['drift'])
+        sindy_regressor.fit(traces_sim, dt_sim)
         logger.info('Simulating RTs from SINDy...')
-        rt_sindy, recovered_params = sindy_regressor.predict(traces_sim['drift'])
-        logger.info(f'Original drift rate: {drift_rate}, SINDy drift rate: {recovered_params["drift_rate"]}')
-        logger.info(f'Original diffusion rate: {diffusion_rate}, SINDy diffusion rate: {recovered_params["diffusion_rate"]}')
+        max_steps = int(np.ceil(t_max / dt_sim).item())
+        rt_sindy, recovered_params = sindy_regressor.sindy_predict_fast(
+            initial_v=traces_sim['drift'][0][15],
+            initial_D=traces_sim['diffusion'][0][15],
+            b=boundary,
+            tnd=tnd,
+            n_sims=n_sims,
+            dt=dt_sim,
+            max_steps=max_steps,
+            seed=None
+        )
 
         rt_dict = {
             'rts': [rt_test, rt_rnn, rt_sindy],

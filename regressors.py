@@ -1,5 +1,6 @@
 import logging
 import os
+from math import comb
 from time import time as current_time
 
 import matplotlib.pyplot as plt
@@ -7,14 +8,12 @@ import numpy as np
 import pysindy as ps
 import torch
 from sklearn.base import BaseEstimator
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR, CosineAnnealingLR
-from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import TensorDataset, DataLoader
-from training_utils import compute_kld
 
 from plotting import plot_rts_multi
 from rnn import VectorizedEvidenceRNN
-from trainers import AdversarialEvidenceAccumulationTrainer, QuantileDiscriminator, QuantileTrainer
+from trainers import WassersteinTrainer
 PYBEAM_DEFAULT_DT = 0.0001
 
 
@@ -25,7 +24,6 @@ class RNNRegressor(BaseEstimator):
                  lr=0.001,
                  lr_schedule=False,
                  batch_size=128,
-                 train_interval=1,
                  init_evidence=0.,
                  init_time=0.2,
                  threshold=1.,
@@ -33,7 +31,6 @@ class RNNRegressor(BaseEstimator):
                  t_max=5.0,
                  min_dt=0.01,
                  max_dt=0.1,
-                 positional_encoding=False,
                  checkpoint_load_path=None,
                  save_path=None,
                  plot_interval=0,
@@ -45,7 +42,6 @@ class RNNRegressor(BaseEstimator):
         self.hidden_layers = hidden_layers
         self.lr = lr
         self.batch_size = batch_size
-        self.train_interval = train_interval
         self.init_evidence = init_evidence
         self.threshold = threshold
         self.t_max = t_max
@@ -65,18 +61,14 @@ class RNNRegressor(BaseEstimator):
             t_max=self.t_max,
             min_dt=min_dt,
             max_dt=max_dt,
-            positional_encoding=positional_encoding,
             device=device).to(device)
 
-        # Set optimizer with selective weight decay: apply only to GRU input weights and output layer weights
+        # Weight decay
         decay_params = []
         nodecay_params = []
         for name, param in self.rnn.named_parameters():
             if not param.requires_grad:
                 continue
-            # is_gru_input_weight = name.startswith('gru') and ('weight_ih' in name)
-            # is_output_weight = (name.startswith('linear_') and name.endswith('weight'))
-            # if is_gru_input_weight or is_output_weight:
             is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
             is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
             if is_gru_weight or is_linear_weight:            
@@ -89,32 +81,11 @@ class RNNRegressor(BaseEstimator):
             { 'params': nodecay_params, 'weight_decay': 0.0 },
         ], lr=lr, betas=(0.5, 0.9))            
 
-        # self.optim_rnn = torch.optim.AdamW(self.rnn.parameters(), lr=lr, betas=(0.5, 0.9), weight_decay=1e-4)
-        # self.discriminator = ConvDiscriminator(batch_size).to(device)
-        # self.discriminator = QuantileDiscriminator(n_quantiles=128, hidden_dim=256, input_range=(-t_max, t_max)).to(device)
-        # self.optim_discriminator = torch.optim.AdamW(self.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)) # , weight_decay=1e-4
-        # if lr_schedule:
-        #     lr_scheduler_linear = LinearLR(optimizer=self.optim_discriminator, start_factor=0.01, end_factor=1.0, total_iters=10)
-        #     lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_discriminator, T_0=8, T_mult=2, eta_min=1e-6)
-        #     lr_scheduler = SequentialLR(optimizer=self.optim_discriminator, schedulers=[lr_scheduler_linear, lr_scheduler_cosine], milestones=[10])
-        # else:
-        #     lr_scheduler = None
-        # self.trainer = AdversarialEvidenceAccumulationTrainer(self.rnn, self.optim_rnn, self.discriminator,
-        #                                                       self.optim_discriminator,
-        #                                                       device=device, train_interval=train_interval,
-        #                                                       print_gradients=print_gradients, scheduler=lr_scheduler)
         if lr_schedule:
-            # lr_scheduler_linear = LinearLR(optimizer=self.optim_rnn, start_factor=0.01, end_factor=1.0, total_iters=10)
-            # lr_scheduler_cosine = CosineAnnealingWarmRestarts(optimizer=self.optim_rnn, T_0=8, T_mult=2, eta_min=1e-6)
-            # self.lr_scheduler = SequentialLR(optimizer=self.optim_rnn, schedulers=[lr_scheduler_linear, lr_scheduler_cosine], milestones=[10])
-            self.lr_scheduler = CosineAnnealingLR(self.optim_rnn, T_max=8192, eta_min=1e-6)
+            self.lr_scheduler = CosineAnnealingLR(self.optim_rnn, T_max=1024, eta_min=1e-6)
         else:
             self.lr_scheduler = None
-        self.trainer = QuantileTrainer(self.rnn, self.optim_rnn,
-                                      device=device,
-                                      print_gradients=print_gradients,
-                                      moment_loss_weight=0.0)
-
+        self.trainer = WassersteinTrainer(self.rnn, self.optim_rnn, print_gradients=print_gradients)
 
         self.verbose = verbose
         if logger:
@@ -138,8 +109,7 @@ class RNNRegressor(BaseEstimator):
             self.logger.info(f'Loaded checkpoint from {checkpoint_load_path}')
 
     def fit(self, rt_train, epochs=100, shuffle=True, bagging=False, early_stopping=False, patience=5, rt_val=None):
-        discriminator, optimizer_discriminator = None, None
-        losses_rnn, losses_dis, accuracies_dis, accuracies_rnn = [], [], [], []
+        losses_rnn, losses_val = [], []
         if rt_val is None:
             rt_val = rt_train.squeeze().detach()
         else:
@@ -147,15 +117,14 @@ class RNNRegressor(BaseEstimator):
         rt_train.detach()
         train_dataset = TensorDataset(rt_train)
         train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True)
-        best_acc = -np.inf
+        best_loss = np.inf
         patience_counter = 0
         save_interval = 100
         try:
             self.logger.info('Training RNN...')
             for epoch in range(epochs):
-                accuracies_epoch = []
                 time_start = current_time()
-                loss_rnn_epoch, loss_dis_epoch, n_batches = 0, 0, 0
+                loss_rnn_epoch, n_batches = 0, 0
                 rts_fake_epoch = torch.empty(0, device=self.device)
                 rts_real_epoch = torch.empty(0, device=self.device)
                 self.rnn.train()
@@ -165,30 +134,13 @@ class RNNRegressor(BaseEstimator):
                     loss_epoch, rts_fake_batch, rts_real_batch = self.trainer.train(data)
                     rts_fake_epoch = torch.cat((rts_fake_epoch, rts_fake_batch.squeeze()), dim=0)
                     rts_real_epoch = torch.cat((rts_real_epoch, rts_real_batch), dim=0)
-                    rnn, optimizer_rnn = self.trainer.rnn, self.trainer.optimizer_rnn
-                    if hasattr(self.trainer, 'discriminator'):
-                        discriminator, optimizer_discriminator = self.trainer.discriminator, self.trainer.optimizer_discriminator
-                    if isinstance(loss_epoch, tuple):
-                        loss_rnn_epoch += loss_epoch[0]
-                        loss_dis_epoch += loss_epoch[1]
-                        accuracies_epoch.append(loss_epoch[1] < 0)
-                    else:
-                        loss_rnn_epoch += loss_epoch
+                    loss_rnn_epoch += loss_epoch
                     n_batches += 1
-                if loss_dis_epoch == 0:
+
                     loss_rnn = loss_rnn_epoch / n_batches
                     losses_rnn.append(loss_rnn)
                     self.logger.info(
                         f'Epoch: {epoch + 1}/{epochs} --- loss: {loss_rnn} --- time: {current_time() - time_start}')
-                else:
-                    loss_rnn = loss_rnn_epoch / n_batches
-                    loss_dis = loss_dis_epoch / n_batches
-                    accuracy_epoch = np.mean(accuracies_epoch)
-                    losses_rnn.append(loss_rnn)
-                    losses_dis.append(loss_dis)
-                    accuracies_dis.append(accuracy_epoch)
-                    self.logger.info(
-                        f'Epoch: {epoch + 1}/{epochs} --- loss RNN: {loss_rnn}; loss Dis: {loss_dis}; acc Dis: {accuracy_epoch} --- time: {current_time() - time_start}')
                 if self.verbose and self.plot_interval > 0 and (((epoch + 1) % self.plot_interval == 0) or epoch == 0):
                     # Plot every N epochs
                     rts_fake_epoch_detached = rts_fake_epoch.squeeze().detach().cpu().numpy()
@@ -203,32 +155,31 @@ class RNNRegressor(BaseEstimator):
                     plt.show()
 
                 # Cross validation with the validation set
-                last_acc = accuracies_rnn[-1] if accuracies_rnn else 0
                 if epoch % 10 == 0:
                     self.logger.info(f'Evaluating RNN on validation set...')
                     self.rnn.eval()
                     with torch.no_grad():
-                        rts_fake, evidence = self.rnn.simulate(traces=False, n_sims=len(rt_val))
+                        rts_fake, _ = self.rnn.simulate(traces=False, n_sims=len(rt_val))
                         rts_fake = rts_fake.squeeze().detach()
-                        kld_val = compute_kld(rts_fake, rt_val.squeeze().detach(), n_bins=128)
-                        kld_train = compute_kld(rts_fake_epoch.squeeze().detach(), rts_real_epoch.squeeze().detach(), n_bins=128)
-                        # self.logger.info(f'KL-divergence predicted || real: {kld} best: {best_kld}')
-                        accuracies_rnn.append(-kld_val)
-                        self.logger.info(f'Accuracy (train): {-kld_train} (val): {-kld_val} best (val): {best_acc}')
+
+                        loss_val = self.trainer.wasserstein_loss(rt_val.squeeze().detach(), rts_fake)
+                        losses_val.append(loss_val)
+                        self.logger.info(f'Loss (val): {loss_val} Best Loss (val): {best_loss}')
 
                     if early_stopping:
-                        if last_acc >= best_acc and last_acc != 0.0:
-                            best_acc = last_acc
+                        if loss_val <= best_loss:
+                            best_loss = loss_val
                             patience_counter = 0
                             self.save_checkpoint_light()
                         else:
                             patience_counter += 1
                             if patience_counter > patience:
-                                self.logger.info(f'Early stopping at epoch {epoch + 1}, best accuracy: {best_acc}')
+                                self.logger.info(f'Early stopping at epoch {epoch + 1}, best loss: {best_loss}')
                                 self.load_checkpoint(load_path=self.checkpoint_save_path)
-                                break                        
+                                break
+                    
                 else:
-                    accuracies_rnn.append(last_acc)
+                    losses_val.append(losses_val[-1])
                     if (epoch + 1) % save_interval == 0 or epoch + 1 == epochs:
                         self.save_checkpoint_light()
                 if self.lr_scheduler is not None:
@@ -245,6 +196,7 @@ class RNNRegressor(BaseEstimator):
         self.logger.info(f'Training finished.\nCheckpoint saved under {self.checkpoint_save_path}')
 
         # print trained rnn parameters
+        rnn = self.trainer.rnn
         list_parameters = ['init_time', 'init_evidence', 'threshold', 'dt', 't_max']
         self.logger.info('\nTrained RNN parameters:')
         for param in list_parameters:
@@ -253,9 +205,9 @@ class RNNRegressor(BaseEstimator):
                 self.logger.info(
                     f'\t{param}:\t{getattr(rnn, param).item() if isinstance(attr, torch.Tensor) else attr}')
 
-        return losses_rnn, accuracies_rnn, losses_dis, accuracies_dis
+        return losses_rnn, losses_val
 
-    def predict(self, X, warmup=5):
+    def predict(self, X, warmup=0):
         self.rnn.eval()
 
         dts = []
@@ -290,16 +242,11 @@ class RNNRegressor(BaseEstimator):
         self.rnn.load_state_dict(params['rnn'], strict=False)
         if 'optimizer_rnn' in params:
             self.optim_rnn.load_state_dict(params['optimizer_rnn'])
-        if 'discriminator' in params:
-            self.discriminator.load_state_dict(params['discriminator'])
-        if 'optimizer_discriminator' in params:
-            self.optim_discriminator.load_state_dict(params['optimizer_discriminator'])
 
     # inside RNNRegressor
     def save_checkpoint_light(self):
         checkpoint = {
             'rnn': {k: v.cpu() for k, v in self.rnn.state_dict().items()},
-            # 'discriminator': {k: v.cpu() for k, v in self.discriminator.state_dict().items()},
             'config': {'path_parameters': self.path_parameters},
         }
         torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)
@@ -307,9 +254,7 @@ class RNNRegressor(BaseEstimator):
     def save_checkpoint_full(self):
         checkpoint = {
             'rnn': self.rnn.state_dict(),
-            # 'discriminator': self.discriminator.state_dict(),
             'optimizer_rnn': self.optim_rnn.state_dict(),
-            # 'optimizer_discriminator': self.optim_discriminator.state_dict(),
             'config': {'path_parameters': self.path_parameters},
         }
         torch.save(checkpoint, self.checkpoint_save_path, _use_new_zipfile_serialization=False)
@@ -318,9 +263,7 @@ class RNNRegressor(BaseEstimator):
         # save model
         checkpoint = {
             'rnn': self.rnn.state_dict(),
-            'discriminator': self.discriminator.state_dict() ,
             'optimizer_rnn': self.optim_rnn.state_dict(),
-            'optimizer_discriminator': self.optim_discriminator.state_dict(),
             'config': {
                 'path_parameters': self.path_parameters,
                 # TODO: add more config parameters
@@ -332,12 +275,12 @@ class RNNRegressor(BaseEstimator):
 class SindyRegressor(BaseEstimator):
     def __init__(self,
                  dt,
-                 poly_order=0,
-                 threshold=0.4,
+                 poly_order=2,
+                 threshold=0.05,
                  ensemble=True,
                  library_ensemble=False,
                  dt_default=PYBEAM_DEFAULT_DT,
-                 fit_intercept=True,
+                 fit_intercept=False,
                  discrete_time=True,
                  initial_evidence=0.,
                  boundary=1.,
@@ -371,19 +314,38 @@ class SindyRegressor(BaseEstimator):
                 ch.setLevel(logging.DEBUG if verbose else logging.WARNING)
                 self.logger.addHandler(ch)
 
+        n_polynomial_combinations = np.array([comb(2 + d, d) for d in range(3)])
+        self.thresholds = np.zeros((1, n_polynomial_combinations[-1]))
+        # self.thresholds = np.array([self.thresholds[0, 1:]])
+        index = 0
+        for d in range(len(n_polynomial_combinations)):
+            self.thresholds[0, index:n_polynomial_combinations[d]] = d * 0.05
+            index = n_polynomial_combinations[d]
+        self.thresholds = np.array([self.thresholds[0, 1:]])
         library = ps.PolynomialLibrary(self.poly_order)
 
-        self.sindy = ps.SINDy(
-            optimizer=ps.SR3(verbose=verbose, threshold=self.threshold, fit_intercept=self.fit_intercept),
+        verbose = False
+
+        self.sindy_drift = ps.SINDy(
+            optimizer=ps.SR3(verbose=verbose, threshold=self.threshold, thresholds = self.thresholds, fit_intercept=self.fit_intercept, thresholder="weighted_l1", max_iter=100),
             feature_library=library,
             discrete_time=self.discrete_time,
-            feature_names=['v', 'sigma'],
-            t_default=self.dt_default,
+            feature_names=['v', 't'],
+            #t_default=self.dt_default,
+            differentiation_method=ps.SmoothedFiniteDifference(),
+        )
+
+        self.sindy_diffusion = ps.SINDy(
+            optimizer=ps.SR3(verbose=verbose, threshold=self.threshold, thresholds = self.thresholds, fit_intercept=self.fit_intercept, thresholder="weighted_l1", max_iter=100),
+            feature_library=library,
+            discrete_time=self.discrete_time,
+            feature_names=['D', 't'],
+            #t_default=self.dt_default,
             differentiation_method=ps.SmoothedFiniteDifference(),
         )
 
     @staticmethod
-    def from_params(dt, training_params, simulation_params, t_max=5.0, verbose=False, device='cpu', logger=None):
+    def from_params(dt, training_params, simulation_params, t_max=5.0, verbose=False, logger=None):
         poly_order = training_params['poly_order']
         threshold = training_params['threshold']
         ensemble = training_params['ensemble']
@@ -396,64 +358,86 @@ class SindyRegressor(BaseEstimator):
         boundary = simulation_params['boundary']
         tnd = simulation_params['tnd']
 
-        verbose = verbose
+        verbose = False
         return SindyRegressor(dt, poly_order, threshold, ensemble, library_ensemble, dt_default, fit_intercept,
-                              discrete_time, initial_evidence, boundary, tnd, t_max, device, logger, verbose)
+                              discrete_time, initial_evidence, boundary, tnd, t_max, logger, verbose)
 
-    def fit(self, drift_traces, u=None):
-        multiple_trajectories = isinstance(drift_traces, list) and isinstance(drift_traces[0], np.ndarray)
+    def fit(self, traces, dt, u=None):
+        drift_traces = traces['drift'][0][15:]
+        diffusion_traces = traces['diffusion'][0][15:]
+        multiple_trajectories = False # isinstance(drift_traces, list) and isinstance(drift_traces[0], np.ndarray)
 
-        self.sindy.fit(drift_traces,
+        t = np.full((drift_traces.shape[0], 1), dt)
+        t = np.cumsum(np.append(0., t[:-1]))
+        t = np.arange(drift_traces.shape[0])
+
+        self.sindy_drift.fit(drift_traces,
                        ensemble=self.ensemble,
                        library_ensemble=self.library_ensemble,
                        multiple_trajectories=multiple_trajectories,
-                       u=u,
-                       t=self.dt
+                       u=t,#u,
+                       t=t,
+                       )
+        self.sindy_diffusion.fit(diffusion_traces,
+                       ensemble=self.ensemble,
+                       library_ensemble=self.library_ensemble,
+                       multiple_trajectories=multiple_trajectories,
+                       u=t,#u,
+                       t=t
                        )
         if self.verbose:
-            self.sindy.print()
+            self.sindy_drift.print()
+            self.sindy_diffusion.print()
+
+        self.logger.info(f'SINDy drift equations: {self.sindy_drift.equations}')
+        self.logger.info(f'SINDy diffusion equations: {self.sindy_diffusion.equations}')
 
         return self
 
-    def predict(self, drift_traces):
-        sindy_pred = self.sindy.predict(drift_traces[0])
+    def sindy_predict_fast(self, initial_v=0.5, initial_D=1.0,
+                        b=1.0, tnd=0.2, n_sims=8192, dt=0.01,
+                        max_steps=100, seed=None):
+        rng = np.random.default_rng(seed)
 
-        # v_mean = sindy_pred[0][0]
-        # v_var = sindy_pred[0][1]
-        # TODO needs to use all v and sigma predictions, not the mean
-        v_mean, v_var = np.mean(sindy_pred, axis=0)
+        v = np.full(n_sims, initial_v, dtype=float)
+        D = np.full(n_sims, initial_D, dtype=float)
+        x = np.zeros(n_sims, dtype=float)
+        t = np.zeros(n_sims, dtype=float)
+        all_v = [initial_v]
+        all_D = [initial_D]
 
-        drift_rate = round(v_mean, 3)
-        diffusion_rate = round(v_var, 3)
+        done = np.zeros(n_sims, dtype=bool)
+        rts = np.empty(n_sims, dtype=float)
 
-        self.logger.debug(f'v_mean: {v_mean}, v_var: {v_var}, dt: {self.dt}')
-        self.logger.debug(f'v = {drift_rate} sigma = {diffusion_rate}')
+        for _ in range(max_steps):
+            active = ~done
+            if not np.any(active):
+                break
 
-        batch_size = 1
+            v_in = v[active][:, None]  # (n_active, 1)
+            D_in = D[active][:, None]  # (n_active, 1)
+            u_in = t[active][:, None]  # (n_active, 1)
 
-        v_mean = torch.tensor(v_mean, device=self.device, dtype=torch.float32).unsqueeze(0)
-        v_var = torch.tensor(v_var, device=self.device, dtype=torch.float32).unsqueeze(0)
-        dt = torch.tensor(self.dt, device=self.device, dtype=torch.float32).unsqueeze(0)
+            v_next = self.sindy_drift.predict(v_in, u=u_in, multiple_trajectories=False).ravel()
+            D_next = self.sindy_diffusion.predict(D_in, u=u_in, multiple_trajectories=False).ravel()
+            # D_next = 1.0
 
-        rts_sindy = []
-        # TODO this needs to be adapted to the vectorized version
-        for _ in tqdm(range(len(drift_traces)), disable=not self.verbose):
-            evidence = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=self.device) + self.initial_evidence
-            time = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=self.device) + self.tnd
-            while any(torch.logical_and(torch.abs(evidence) < self.boundary, time < self.max_time)):
-                dx = v_mean + torch.matmul(self.epsilon(), v_var)
-                evidence, time = self.accumulate(evidence, dx, time, dt)
-            rt = time * torch.sign(evidence)
-            rts_sindy.append(rt.cpu().numpy().squeeze().item())
+            all_v.append(v_next[0])
+            all_D.append(D_next[0])
 
-        return rts_sindy, {'drift_rate': drift_rate, 'diffusion_rate': diffusion_rate}
+            noise = rng.standard_normal(v_next.shape[0])
+            x[active] += v_next * dt + D_next * np.sqrt(dt) * noise
+            t[active] += dt
+            v[active] = v_next
+            D[active] = D_next
 
-    def accumulate(self, evidence, dx, time, dt):
-        mask = ((torch.abs(evidence) < self.boundary) & (time < self.max_time)).view(-1)
-        evidence[mask] += dx[mask]
-        time[mask] += dt[mask]
+            crossed = (np.abs(x) >= b) & active
+            if np.any(crossed):
+                rts[crossed] = (tnd + t[crossed]) * np.sign(x[crossed])
+                done[crossed] = True
 
-        return evidence, time
-
-    def epsilon(self):
-        return torch.randn((1), device=self.device, dtype=torch.float32)
+        # If any didn’t cross by max_steps, record the current time (optional)
+        if np.any(~done):
+            pending = ~done
+            rts[pending] = (tnd + t[pending]) * np.sign(x[pending])
+        return rts, {'drift_rate': all_v, 'diffusion_rate': all_D}
