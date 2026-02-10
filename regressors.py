@@ -31,13 +31,17 @@ class RNNRegressor(BaseEstimator):
                  t_max=5.0,
                  min_dt=0.01,
                  max_dt=0.1,
+                 max_steps=None,
+                 warmup=0,
                  checkpoint_load_path=None,
                  save_path=None,
                  plot_interval=0,
                  device='cpu',
                  logger=None,
                  verbose=True,
-                 print_gradients=False):
+                 print_gradients=False,
+                 dropout=0.15,
+                 weight_decay=1e-4):
         self.hidden_dim = hidden_dim
         self.hidden_layers = hidden_layers
         self.lr = lr
@@ -49,7 +53,8 @@ class RNNRegressor(BaseEstimator):
         self.save_path = save_path
         self.plot_interval = plot_interval
         self.device = device
-
+        self.dropout = dropout
+        self.weight_decay = weight_decay
 
         self.rnn = VectorizedEvidenceRNN(
             hidden_dim=hidden_dim,
@@ -61,25 +66,40 @@ class RNNRegressor(BaseEstimator):
             t_max=self.t_max,
             min_dt=min_dt,
             max_dt=max_dt,
-            device=device).to(device)
+            max_steps=max_steps,
+            warmup=warmup,
+            device=device,
+            dropout=dropout).to(device)
 
         # Weight decay
-        decay_params = []
+        # Separate parameter groups: GRU weights, linear_dx weights, and the rest
+        gru_params = []
+        linear_dx_weight_params = []
         nodecay_params = []
         for name, param in self.rnn.named_parameters():
             if not param.requires_grad:
                 continue
+
             is_gru_weight = name.startswith('gru') and ('weight_ih' in name or 'weight_hh' in name)
-            is_linear_weight = (name.startswith('linear_') and name.endswith('weight'))
-            if is_gru_weight or is_linear_weight:            
-                decay_params.append(param)
+            is_linear_dx_weight = name.startswith('linear_dx') and name.endswith('weight')
+
+            if is_gru_weight:
+                gru_params.append(param)
+            elif is_linear_dx_weight:
+                linear_dx_weight_params.append(param)
             else:
                 nodecay_params.append(param)
 
-        self.optim_rnn = torch.optim.AdamW([
-            { 'params': decay_params, 'weight_decay': 1e-4 },
-            { 'params': nodecay_params, 'weight_decay': 0.0 },
-        ], lr=lr, betas=(0.5, 0.9))            
+        # Set weight decay and learning rate for each parameter group
+        self.optim_rnn = torch.optim.AdamW(
+            [
+                { 'params': gru_params, 'weight_decay': self.weight_decay, 'lr': lr },
+                { 'params': linear_dx_weight_params, 'weight_decay': 0.0, 'lr': lr },
+                { 'params': nodecay_params, 'weight_decay': 0.0, 'lr': lr },
+            ],
+            lr=lr,
+            betas=(0.9, 0.999),
+        )            
 
         if lr_schedule:
             self.lr_scheduler = CosineAnnealingLR(self.optim_rnn, T_max=1024, eta_min=1e-6)
@@ -207,7 +227,7 @@ class RNNRegressor(BaseEstimator):
 
         return losses_rnn, losses_val
 
-    def predict(self, X, warmup=0):
+    def predict(self, X):
         self.rnn.eval()
 
         dts = []
@@ -219,7 +239,7 @@ class RNNRegressor(BaseEstimator):
         # Simulate evidence traces
         self.logger.info('Simulating RTs and evidence traces from RNN...')
         with torch.no_grad():
-            time, evidence, time_trace, evidence_trace, drift_trace, diffusion_traces, decision_indices = self.rnn.simulate(traces=True, n_sims=len(X), warmup=warmup)
+            time, evidence, time_trace, evidence_trace, drift_trace, diffusion_traces, decision_indices = self.rnn.simulate(traces=True, n_sims=len(X))
             rts = time.detach().cpu().numpy()
             traces['evidence'] = evidence_trace
             traces['time'] = time_trace
@@ -285,7 +305,7 @@ class SindyRegressor(BaseEstimator):
                  initial_evidence=0.,
                  boundary=1.,
                  tnd=0.2,
-                 max_time=5.,
+                 warmup=0,
                  device='cpu',
                  logger=None,
                  verbose=True, ):
@@ -301,17 +321,17 @@ class SindyRegressor(BaseEstimator):
         self.initial_evidence = initial_evidence
         self.boundary = boundary
         self.tnd = tnd
-        self.max_time = max_time
         self.verbose = verbose
+        self.warmup = warmup
         if logger:
             self.logger = logger
         else:
             self.logger = logging.getLogger(__name__)
             if not self.logger.hasHandlers():
-                self.logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
+                self.logger.setLevel(logging.DEBUG)
 
                 ch = logging.StreamHandler()
-                ch.setLevel(logging.DEBUG if verbose else logging.WARNING)
+                ch.setLevel(logging.DEBUG)
                 self.logger.addHandler(ch)
 
         n_polynomial_combinations = np.array([comb(2 + d, d) for d in range(3)])
@@ -345,7 +365,7 @@ class SindyRegressor(BaseEstimator):
         )
 
     @staticmethod
-    def from_params(dt, training_params, simulation_params, t_max=5.0, verbose=False, logger=None):
+    def from_params(dt, training_params, simulation_params, rnn_params, t_max=5.0, verbose=False, logger=None):
         poly_order = training_params['poly_order']
         threshold = training_params['threshold']
         ensemble = training_params['ensemble']
@@ -353,18 +373,18 @@ class SindyRegressor(BaseEstimator):
         dt_default = training_params['dt_default']
         fit_intercept = training_params['fit_intercept']
         discrete_time = training_params['discrete_time']
-
+        warmup = rnn_params['warmup']
         initial_evidence = simulation_params['starting_point'] - 0.5  # subtract 0.5 to center the evidence
         boundary = simulation_params['boundary']
         tnd = simulation_params['tnd']
 
         verbose = False
-        return SindyRegressor(dt, poly_order, threshold, ensemble, library_ensemble, dt_default, fit_intercept,
-                              discrete_time, initial_evidence, boundary, tnd, t_max, logger, verbose)
+        return SindyRegressor(dt=dt, poly_order=poly_order, threshold=threshold, ensemble=ensemble, library_ensemble=library_ensemble, dt_default=dt_default, fit_intercept=fit_intercept,
+                              discrete_time=discrete_time, initial_evidence=initial_evidence, boundary=boundary, tnd=tnd, warmup=warmup, logger=logger, verbose=verbose)
 
     def fit(self, traces, dt, u=None):
-        drift_traces = traces['drift'][0][15:]
-        diffusion_traces = traces['diffusion'][0][15:]
+        drift_traces = traces['drift'][0][self.warmup:]
+        diffusion_traces = traces['diffusion'][0][self.warmup:]
         multiple_trajectories = False # isinstance(drift_traces, list) and isinstance(drift_traces[0], np.ndarray)
 
         t = np.full((drift_traces.shape[0], 1), dt)
@@ -389,8 +409,8 @@ class SindyRegressor(BaseEstimator):
             self.sindy_drift.print()
             self.sindy_diffusion.print()
 
-        self.logger.info(f'SINDy drift equations: {self.sindy_drift.equations}')
-        self.logger.info(f'SINDy diffusion equations: {self.sindy_diffusion.equations}')
+        self.logger.info(f'SINDy drift equations: {self.sindy_drift.equations()}')
+        self.logger.info(f'SINDy diffusion equations: {self.sindy_diffusion.equations()}')
 
         return self
 

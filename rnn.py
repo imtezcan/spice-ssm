@@ -8,14 +8,15 @@ from decision import SimpleThresholdFunction
 class VectorizedEvidenceRNN(nn.Module):
     def __init__(self, hidden_dim, hidden_layers=0,
                  init_evidence=0., init_time=0.2, threshold=1., learn_threshold=False,
-                 t_max=5.0, min_dt=0.01, max_dt=0.1,
-                 device='cpu'):
+                 t_max=5.0, min_dt=0.01, max_dt=0.1, max_steps=None,
+                 warmup=0, device='cpu', dropout=0.15):
         super(VectorizedEvidenceRNN, self).__init__()
 
         self.device = torch.device(device)
         self.hidden_dim = hidden_dim
         self.hidden_layers = hidden_layers
-
+        self.warmup = warmup
+        self.dropout = dropout
         # DDM Parameters
         self.init_evidence = init_evidence
         self.init_time = init_time
@@ -25,6 +26,7 @@ class VectorizedEvidenceRNN(nn.Module):
         self.max_dt = max_dt
         self.dt = nn.Parameter(torch.tensor(self.max_dt, dtype=torch.float32), requires_grad=False)
         self.t_max = torch.tensor(t_max, dtype=torch.float32, requires_grad=False, device=self.device)
+        self.max_steps = max_steps
         self.dx_dim = 1
 
         # Trace values
@@ -36,7 +38,8 @@ class VectorizedEvidenceRNN(nn.Module):
             input_size = self.dx_dim, #1,
             hidden_size=hidden_dim,
             num_layers=hidden_layers+1,
-            batch_first=True
+            batch_first=True,
+            dropout=self.dropout
         )
 
         # Drift & Diffusion layer
@@ -50,13 +53,19 @@ class VectorizedEvidenceRNN(nn.Module):
     def init_trial(self, init_evidence=None, batch_size=1):
         self.batch_size = batch_size
 
-    def simulate(self, traces=False, n_sims=1, X=None, warmup=0):
+    def simulate(self, traces=False, n_sims=1, X=None):
         self.init_trial(batch_size=n_sims)
-        return self.forward(traces=traces, h_input=X, warmup=warmup)
+        return self.forward(traces=traces, h_input=X)
 
-    def forward(self, h_input=None, traces=False, warmup=0):
-        max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
-        # max_steps = 100
+    def forward(self, h_input=None, traces=False):
+        # Adjust timestep size and number of max steps
+        if self.max_steps:
+            max_steps = self.max_steps
+            dt = self.t_max / max_steps
+        else:
+            max_steps = int(torch.ceil(self.t_max / self.min_dt).item())
+            dt = torch.tensor(self.min_dt, device=self.device)
+
         batch_size = self.batch_size
 
         hidden = torch.zeros(
@@ -82,20 +91,20 @@ class VectorizedEvidenceRNN(nn.Module):
         else:
             h_input = torch.tensor(h_input, dtype=torch.float32, device=self.device)
 
-        warmup_input = torch.ones((batch_size, warmup, self.dx_dim), device=self.device)
-        if warmup > 0:
+        warmup_input = torch.ones((batch_size, self.warmup, self.dx_dim), device=self.device)
+        if self.warmup > 0:
             _, hidden = self.gru(warmup_input, hidden)
 
         gru_out, _ = self.gru(h_input, hidden)
+        gru_out = F.dropout(gru_out, p=self.dropout, training=self.training)
 
         mu_sigma = self.linear_dx(gru_out)
 
-        mu = torch.clamp(mu_sigma[:, :, 0], min=-100.0, max=100.0).unsqueeze(1).view(batch_size, max_steps, 1)
-        sigma = torch.clamp(mu_sigma[:, :, 1], min=0.9, max=1.1).unsqueeze(1).view(batch_size, max_steps, 1)
 
-        # Get timestep size
-        dt = torch.tensor(self.min_dt, device=self.device)
-        # dt = self.t_max / max_steps
+        mu = mu_sigma[:, :, 0].unsqueeze(1).view(batch_size, max_steps, 1)
+        sigma = mu_sigma[:, :, 1].unsqueeze(1).view(batch_size, max_steps, 1)
+        sigma = F.softplus(sigma)
+
         # Calculate evidence
         epsilon = torch.randn((batch_size, max_steps, 1), device=self.device, requires_grad=False)
         dx = mu * dt + sigma * epsilon * torch.sqrt(dt)

@@ -49,6 +49,8 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
         batch_size = n_sims
     min_dt = rnn_params['min_dt']
     max_dt = rnn_params['max_dt']
+    max_steps = rnn_params.get('max_steps', None)
+    warmup = rnn_params.get('warmup', 0)
 
     # Training parameters
     checkpoint = training_params['checkpoint']
@@ -62,6 +64,8 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
     plot_interval = training_params['plot_interval']
     learn_threshold = training_params.get('learn_threshold', False)
     device = training_params['device'] if training_params.get('device') else 'cuda' if torch.cuda.is_available() else 'cpu'
+    dropout = training_params.get('dropout', 0.15)
+    weight_decay = training_params.get('weight_decay', 0.0001)
 
     # SINDy setup
     run_sindy = sindy_params['run_sindy']
@@ -123,13 +127,17 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
                                  t_max=t_max,
                                  min_dt=min_dt,
                                  max_dt=max_dt,
+                                 max_steps=max_steps,
+                                 warmup=warmup,
                                  checkpoint_load_path=checkpoint_load_path,
                                  save_path=output_dir,
                                  plot_interval=plot_interval,
                                  device=device,
                                  logger=logger,
                                  verbose=verbose,
-                                 print_gradients=print_gradients)
+                                 print_gradients=print_gradients,
+                                 dropout=dropout,
+                                 weight_decay=weight_decay)
 
     losses_rnn, losses_val = rnn_regressor.fit(rt_train,
                                                                                rt_val=rt_val,
@@ -205,16 +213,18 @@ def main(output_dir, ddm_params, simulation_params, rnn_params, training_params,
         sindy_regressor = SindyRegressor.from_params(dt=dt_sim,
                                                      training_params=sindy_params['training'],
                                                      simulation_params=ddm_params,
+                                                     rnn_params=rnn_params,
                                                      t_max=t_max,
                                                      verbose=verbose,
                                                      logger=logger)
         logger.info('Fitting SINDy model...')
         sindy_regressor.fit(traces_sim, dt_sim)
         logger.info('Simulating RTs from SINDy...')
-        max_steps = int(np.ceil(t_max / dt_sim).item())
+        if max_steps is None:
+            max_steps = int(np.ceil(t_max / dt_sim).item())
         rt_sindy, recovered_params = sindy_regressor.sindy_predict_fast(
-            initial_v=traces_sim['drift'][0][15],
-            initial_D=traces_sim['diffusion'][0][15],
+            initial_v=traces_sim['drift'][0][warmup],
+            initial_D=traces_sim['diffusion'][0][warmup],
             b=boundary,
             tnd=tnd,
             n_sims=n_sims,
@@ -343,22 +353,52 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="simpleddm.yml")
     parser.add_argument("--train_count", type=int, default=1)
     parser.add_argument("--drift_rates", type=float, nargs='+', default=None)
+    parser.add_argument("--config_folder", type=str, default=None)
     args = parser.parse_args()
 
-    # Load parameters from the given configuration file if possible
-    config = setup_experiment(args.config)
-    drift_rates = args.drift_rates
-    if drift_rates is None:
-        # If no drift rates are given, use the one from the configuration file
-        drift_rates = [config['ddm_params']['drift']]
-    for i in range(args.train_count):
-        print(f'Running experiments {i + 1}/{args.train_count}...')
-        for drift_rate in drift_rates:
-            print(f'Training experiment {i + 1} for drift rate {drift_rate}...')
-            config = setup_experiment(args.config)
-            if config is None:
-                print(f"Experiment not configured properly. Using default parameters.")
-                config = {}
-            config['ddm_params']['drift'] = drift_rate
-            dump_config(config)
+    if args.config_folder is not None:
+        # enumerate all files in directory
+        config_files = os.listdir(args.config_folder)
+        print(f'List of configs {config_files}')
+
+        for config_file in config_files:
+            print(f'Config: {config_file}')
+            # Load parameters from the given configuration file if possible
+            print(f'Loading config from {os.path.join(args.config_folder, config_file)}')
+            config = setup_experiment(os.path.join(args.config_folder, config_file))
+            drift_rates = args.drift_rates
+            if drift_rates is None:
+                # If no drift rates are given, use the one from the configuration file
+                drift_rates = [config['ddm_params']['drift']]
+            for i in range(args.train_count):
+                print(f'Running experiments {i + 1}/{args.train_count}...')
+                for drift_rate in drift_rates:
+                    print(f'Training experiment {i + 1} for drift rate {drift_rate}...')
+                    config = setup_experiment(os.path.join(args.config_folder, config_file))
+                    if config is None:
+                        print(f"Experiment not configured properly. Using default parameters.")
+                        config = {}
+                    config['ddm_params']['drift'] = drift_rate
+                    dump_config(config)
+                    main(**config)
+
             main(**config)
+
+    else:
+        # Load parameters from the given configuration file if possible
+        config = setup_experiment(args.config)
+        drift_rates = args.drift_rates
+        if drift_rates is None:
+            # If no drift rates are given, use the one from the configuration file
+            drift_rates = [config['ddm_params']['drift']]
+        for i in range(args.train_count):
+            print(f'Running experiments {i + 1}/{args.train_count}...')
+            for drift_rate in drift_rates:
+                print(f'Training experiment {i + 1} for drift rate {drift_rate}...')
+                config = setup_experiment(args.config)
+                if config is None:
+                    print(f"Experiment not configured properly. Using default parameters.")
+                    config = {}
+                config['ddm_params']['drift'] = drift_rate
+                dump_config(config)
+                main(**config)
